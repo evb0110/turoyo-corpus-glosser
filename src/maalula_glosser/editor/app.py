@@ -21,6 +21,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import threading
 import uuid
 import zipfile
 from pathlib import Path
@@ -768,20 +769,49 @@ def create_app(root: Path | str = ".", *, warm: bool = False) -> FastAPI:
     # before/after statistics, independent of how long the journal itself lives.
     history = H.History(on_record=EL.sink(root))
 
+    def _review_lines(document: dict[str, Any]) -> dict[str, Any]:
+        """The little of a document that review bookkeeping reads: its title
+        and, per sentence, (words, reviewed_by, reviewed_word_count). Kept per
+        document by `store.summary`, so the project-wide passes below parse
+        only the documents that changed since the last pass."""
+        return {
+            "title": document.get("title"),
+            "lines": tuple(
+                (sum(1 for token in sentence.get("tokens") or []
+                     if not S.is_speaker(token)),
+                 sentence.get("reviewed_by"),
+                 sentence.get("reviewed_word_count"))
+                for sentence in document.get("sentences") or []
+            ),
+        }
+
     def _review_totals() -> dict[str, int]:
         """Rubles owed to each name that has ticked a "проверено" box
         anywhere in the project, one pass over the whole store — the same
         shape as `senses.text_titles_by_lexeme`, for the same reason: every
-        document could have been touched, and there is no cheaper index."""
+        document could have been touched, and there is no cheaper index.
+        Unchanged documents come from `store.summary` instead of a re-parse."""
         totals: dict[str, int] = {}
         for listed in store.list():
-            document = store.load(listed["document_id"])
-            for sentence in document.get("sentences") or []:
-                name = sentence.get("reviewed_by")
-                count = sentence.get("reviewed_word_count")
+            review = store.summary(listed["document_id"], "review-lines", _review_lines)
+            for _words, name, count in review["lines"]:
                 if name and count:
                     totals[name] = totals.get(name, 0) + count * REVIEW_RATE_RUB_PER_WORD
         return totals
+
+    if warm:
+        # Fill `store`'s per-document cache off the request path: a cold
+        # pass over the hosted shelf parses every session (~15 s), which the
+        # first "проверено" click or homepage visit after a restart would
+        # otherwise wait for.
+        def _warm_review_cache() -> None:
+            try:
+                _review_totals()
+            except Exception:  # a warm-up must never take the server down
+                pass
+
+        threading.Thread(target=_warm_review_cache, name="review-cache-warm",
+                         daemon=True).start()
 
     def _review_statistics() -> dict[str, Any]:
         """Project-wide statistics based ONLY on explicit review checkboxes."""
@@ -795,8 +825,8 @@ def create_app(root: Path | str = ".", *, warm: bool = False) -> FastAPI:
 
         for listed in store.list():
             document_id = listed["document_id"]
-            document = store.load(document_id)
-            sentences = document.get("sentences") or []
+            review = store.summary(document_id, "review-lines", _review_lines)
+            sentences = review["lines"]
 
             document_total_lines = len(sentences)
             document_reviewed_lines = 0
@@ -805,20 +835,14 @@ def create_app(root: Path | str = ".", *, warm: bool = False) -> FastAPI:
 
             reviewers: dict[str, dict[str, int]] = {}
 
-            for sentence in sentences:
-                line_words = sum(
-                    1
-                    for token in sentence.get("tokens") or []
-                    if not S.is_speaker(token)
-                )
+            for line_words, reviewed_by, count in sentences:
                 document_total_words += line_words
 
-                name = S.nfc(sentence.get("reviewed_by") or "").strip()
+                name = S.nfc(reviewed_by or "").strip()
 
                 if not name:
                     continue
 
-                count = sentence.get("reviewed_word_count")
                 if count is None:
                     # Compatibility with an old checked row that predates
                     # reviewed_word_count.
@@ -865,7 +889,7 @@ def create_app(root: Path | str = ".", *, warm: bool = False) -> FastAPI:
             documents.append({
                 "document_id": document_id,
                 "title": (
-                    document.get("title")
+                    review["title"]
                     or listed.get("title")
                     or document_id
                 ),
@@ -2936,30 +2960,37 @@ def create_app(root: Path | str = ".", *, warm: bool = False) -> FastAPI:
         return {"history": history.state(document_id)}
 
     # ---- the single-editor lock ----
+    def _require_document(document_id: str) -> None:
+        """404 for a document that is not on the shelf. Checks the file
+        rather than parsing it: every open tab polls the lock every 15 s, and
+        parsing a large session for that took about a second each time."""
+        if not store.exists(document_id):
+            raise HTTPException(404, f"no such document {document_id}")
+
     def _lock_view(document_id: str, client_id: str) -> dict[str, Any]:
         holder = locks.status(document_id)
         return {"holder": holder, "you_are_holder": locks.holder_is(document_id, client_id)}
 
     @app.get("/api/documents/{document_id}/lock")
     def get_lock(document_id: str, client_id: str = ""):
-        store.load(document_id)  # 404s if the document does not exist
+        _require_document(document_id)
         return _lock_view(document_id, client_id)
 
     @app.post("/api/documents/{document_id}/lock/claim")
     def claim_lock(document_id: str, body: LockClaimBody):
-        store.load(document_id)
+        _require_document(document_id)
         locks.claim(document_id, body.client_id, S.nfc(body.name).strip())
         return _lock_view(document_id, body.client_id)
 
     @app.post("/api/documents/{document_id}/lock/take-over")
     def take_over_lock(document_id: str, body: LockClaimBody):
-        store.load(document_id)
+        _require_document(document_id)
         locks.take_over(document_id, body.client_id, S.nfc(body.name).strip())
         return _lock_view(document_id, body.client_id)
 
     @app.post("/api/documents/{document_id}/lock/release")
     def release_lock(document_id: str, body: LockReleaseBody):
-        store.load(document_id)
+        _require_document(document_id)
         locks.release(document_id, body.client_id)
         return _lock_view(document_id, body.client_id)
 
